@@ -1,0 +1,30 @@
+export declare global {
+  namespace ReactNavigation {
+    interface RootParamList {
+      home: undefined;
+      wallets: undefined;
+      wallet: { walletGroupId: string };
+      setWallet: { walletGroupId?: string } | undefined;
+      connect: undefined;
+      'connect/pluggy':
+        | {
+            updateConnectionId?: string;
+          }
+        | undefined;
+      'connect/belvo':
+        | {
+            updateConnectionId?: string;
+          }
+        | undefined;
+      manualConnect: undefined;
+      transactions: { categoryId?: string; walletId?: string } | undefined;
+      transaction: { transactionId: string };
+      setTransaction: { transactionType: string; transactionId?: string };
+      history: undefined;
+      settings: undefined;
+      categories: undefined;
+      analysis: undefined;
+      categoryHistory: { categoryId: string };
+    }
+  }
+}

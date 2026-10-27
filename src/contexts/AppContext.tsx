@@ -1,0 +1,596 @@
+import * as FileSystem from 'expo-file-system';
+import moment, { Moment } from 'moment';
+import React, { createContext, useCallback, useEffect, useMemo, useState } from 'react';
+import { Platform } from 'react-native';
+import Toast from 'react-native-toast-message';
+import LoadingModal from '../components/LoadingModal';
+import { Transaction, Wallet, WalletGroup } from '../models';
+import Provider from '../models/provider';
+import { transactionRepository, walletGroupRepository, walletRepository } from '../repositories';
+import { getProviderService } from '../services/providerServiceFactory';
+import { range } from '../utils/array';
+import { CURRENT_MONTH, NOW } from '../utils/date';
+import { RecursivePartial } from '../utils/type';
+
+export type MonthlyBalance = {
+  date: Moment;
+  incomes: number;
+  expenses: number;
+};
+
+export type AppContextValue = {
+  date: Moment;
+  setDate: (value: Moment) => void;
+  hideValues: boolean;
+  setHideValues: (value: boolean) => void;
+
+  setupConnection: (connectionId: string, provider: Provider) => Promise<void>;
+  syncWalletGroup: (walletGroup: WalletGroup) => Promise<void>;
+
+  wallets: Wallet[];
+  fetchWallets: () => Promise<void>;
+  fetchingWallets: boolean;
+  updateWallet: (id: string, values: RecursivePartial<Wallet>) => Promise<void>;
+  totalBalance: number;
+
+  walletGroups: WalletGroup[];
+  fetchWalletGroups: () => Promise<void>;
+  fetchingWalletGroups: boolean;
+  createManualWallet: (walletGroup: WalletGroup, wallet: Wallet) => Promise<void>;
+  updateWalletGroup: (id: string, values: RecursivePartial<WalletGroup>) => Promise<void>;
+  deleteWalletGroup: (walletGroup: WalletGroup) => Promise<void>;
+
+  transactions: Transaction[];
+  fetchTransactions: () => Promise<void>;
+  fetchingTransactions: boolean;
+  createTransaction: (transaction: Transaction) => Promise<void>;
+  updateTransaction: (
+    id: string,
+    values: RecursivePartial<Transaction>,
+    updateWalletBalance: boolean,
+  ) => Promise<void>;
+  deleteTransaction: (transaction: Transaction) => Promise<void>;
+  incomeTransactions: Transaction[];
+  totalIncomes: number;
+  expenseTransactions: Transaction[];
+  totalExpenses: number;
+
+  totalInvoice: number;
+  totalInvestment: number;
+
+  monthlyBalances: MonthlyBalance[];
+  fetchMonthlyBalancesPage: (itemsPerPage: number, currentPage: number) => Promise<void>;
+  fetchingMonthlyBalances: boolean;
+  currentMonthlyBalancesPage: number;
+  setCurrentMonthlyBalancesPage: (value: number) => void;
+
+  exportTransactions: () => Promise<void>;
+};
+
+const AppContext = createContext({} as AppContextValue);
+
+export const AppContextProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [date, setDate] = useState(NOW.clone());
+  const [hideValues, setHideValues] = useState(false);
+
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState<string>();
+
+  const [wallets, setWallets] = useState([] as Wallet[]);
+  const [fetchingWallets, setFetchingWallets] = useState(false);
+
+  const [walletGroups, setWalletGroups] = useState([] as WalletGroup[]);
+  const [fetchingWalletGroups, setFetchingWalletGroups] = useState(false);
+
+  const [transactions, setTransactions] = useState([] as Transaction[]);
+  const [fetchingTransactions, setFetchingTransactions] = useState(false);
+
+  const [monthlyBalances, setMonthlyBalances] = useState([] as MonthlyBalance[]);
+  const [fetchingMonthlyBalances, setFetchingMonthlyBalances] = useState(false);
+  const [currentMonthlyBalancesPage, setCurrentMonthlyBalancesPage] = useState(0);
+
+  const transactionQueryOptions = useMemo(
+    () =>
+      ({
+        interval: {
+          startDate: date.startOf('month').toDate(),
+          endDate: date.endOf('month').toDate(),
+        },
+        order: {
+          by: 'date',
+          direction: 'desc',
+        },
+      } as transactionRepository.TransactionQueryOptions),
+    [date],
+  );
+
+  const totalBalance = useMemo(
+    () =>
+      wallets
+        .filter(({ type }) => type === 'CHECKING_ACCOUNT' || type === 'SAVINGS_ACCOUNT')
+        .reduce((total, { balance }) => total + balance, 0),
+    [wallets],
+  );
+
+  const incomeTransactions = useMemo(
+    () => transactions.filter(({ type }) => type === 'INCOME'),
+    [transactions],
+  );
+
+  const totalIncomes = useMemo(
+    () =>
+      incomeTransactions
+        .filter(({ ignore }) => !ignore)
+        .reduce((total, transaction) => total + Math.abs(transaction.amount), 0),
+    [incomeTransactions],
+  );
+
+  const expenseTransactions = useMemo(
+    () => transactions.filter(({ type }) => type === 'EXPENSE'),
+    [transactions],
+  );
+
+  const totalExpenses = useMemo(
+    () =>
+      expenseTransactions
+        .filter(({ ignore }) => !ignore)
+        .reduce((total, transaction) => total + Math.abs(transaction.amount), 0),
+    [expenseTransactions],
+  );
+
+  const totalInvoice = useMemo(
+    () =>
+      wallets
+        .filter(({ type }) => type === 'CREDIT_CARD')
+        .reduce((total, { balance }) => total + balance, 0),
+    [wallets],
+  );
+
+  const totalInvestment = useMemo(
+    () =>
+      walletGroups.reduce(
+        (total, walletGroup) =>
+          total + (walletGroup.type === 'AUTOMATIC' ? walletGroup.investmentAmount || 0 : 0),
+        0,
+      ),
+    [walletGroups],
+  );
+
+  const setLoading = (status: boolean, message?: string) => {
+    setIsLoading(status);
+    setLoadingMessage(message);
+  };
+
+  const setupConnection = async (connectionId: string, provider: Provider) => {
+    const providerService = getProviderService(provider);
+
+    setLoading(true, 'Configurando nova conexão');
+
+    await providerService.fetchConnection(
+      connectionId,
+      walletGroupRepository.setWalletGroup,
+      walletRepository.setWalletsBatch,
+      transactionRepository.setTransactionsBatch,
+    );
+
+    setLoading(false);
+  };
+
+  const syncWalletGroup = useCallback(
+    async (walletGroup: WalletGroup, configureLoading = true) => {
+      if (walletGroup.type !== 'AUTOMATIC') {
+        return;
+      }
+
+      const providerService = getProviderService(walletGroup.provider);
+
+      configureLoading && setLoading(true, 'Sincronizando conexão');
+
+      try {
+        const groupWallets = wallets.filter((wallet) => wallet.walletGroupId === walletGroup.id);
+
+        const lastTransactions = await Promise.all(
+          groupWallets.map((wallet) => transactionRepository.getLastWalletTransaction(wallet.id)),
+        );
+
+        const lastUpdateDate = lastTransactions.reduce(
+          (oldest, transaction) =>
+            transaction && transaction.date < oldest ? transaction.date : oldest,
+          walletGroup.lastUpdatedAt,
+        );
+
+        await providerService.syncConnection(
+          walletGroup.id,
+          lastUpdateDate,
+          !walletGroup.updateDisabled,
+          (values) => walletGroupRepository.updateWalletGroup(walletGroup.id, values),
+          walletRepository.updateWalletsBatch,
+          transactionRepository.securelySetTransactionsBatch,
+        );
+      } catch (error) {
+        Toast.show({
+          type: 'error',
+          text1: `Erro ao sincronizar conexão "${walletGroup.name}"!`,
+        });
+      }
+
+      configureLoading && setLoading(false);
+    },
+    [wallets],
+  );
+
+  const fetchWallets = async () => {
+    setFetchingWallets(true);
+
+    try {
+      const wallets = await walletRepository.getWallets();
+      setWallets(wallets);
+    } catch (error) {
+      Toast.show({ type: 'error', text1: 'Não foi possível obter informações das carteiras!' });
+    }
+
+    setFetchingWallets(false);
+  };
+
+  const fetchWalletGroups = async () => {
+    setFetchingWalletGroups(true);
+
+    try {
+      const walletGroups = await walletGroupRepository.getWalletGroups();
+      setWalletGroups(walletGroups);
+    } catch (error) {
+      Toast.show({ type: 'error', text1: 'Não foi possível obter informações das carteiras!' });
+    }
+
+    setFetchingWalletGroups(false);
+  };
+
+  const createManualWallet = async (walletGroup: WalletGroup, wallet: Wallet) => {
+    setFetchingWallets(true);
+
+    try {
+      await walletGroupRepository.setWalletGroup(walletGroup);
+      await walletRepository.setWallet(wallet);
+      Toast.show({ type: 'success', text1: 'Carteira criada com sucesso!' });
+    } catch (error) {
+      Toast.show({ type: 'error', text1: 'Não foi possível criar a carteira!' });
+    }
+
+    setFetchingWallets(false);
+  };
+
+  const updateWallet = async (id: string, values: RecursivePartial<Wallet>) => {
+    setFetchingWallets(true);
+
+    try {
+      await walletRepository.updateWallet(id, values);
+      Toast.show({ type: 'success', text1: 'Carteira atualizada com sucesso!' });
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível atualizar as informações da carteira!',
+      });
+    }
+
+    setFetchingWallets(false);
+  };
+
+  const updateWalletGroup = async (id: string, values: RecursivePartial<WalletGroup>) => {
+    setFetchingWallets(true);
+
+    try {
+      await walletGroupRepository.updateWalletGroup(id, values);
+      Toast.show({ type: 'success', text1: 'Carteira atualizada com sucesso!' });
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível atualizar as informações da carteira!',
+      });
+    }
+
+    setFetchingWallets(false);
+  };
+
+  const deleteWalletGroup = async (walletGroup: WalletGroup) => {
+    setFetchingWallets(true);
+
+    let hasError = false;
+
+    const groupWallets = wallets.filter((wallet) => wallet.walletGroupId === walletGroup.id);
+
+    try {
+      await Promise.all(groupWallets.map((wallet) => walletRepository.deleteWallet(wallet)));
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível apagar a carteira!',
+      });
+      setFetchingWallets(false);
+      return;
+    }
+
+    try {
+      await Promise.all(
+        groupWallets.map((wallet) =>
+          transactionRepository.deleteAllTransactionsByWalletId(wallet.id),
+        ),
+      );
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível apagar as transações da carteira!',
+      });
+      hasError = true;
+    }
+
+    try {
+      if (walletGroup.type === 'AUTOMATIC') {
+        const providerService = getProviderService(walletGroup.provider);
+        await providerService.deleteConnection(walletGroup.id);
+      }
+
+      await walletGroupRepository.deleteWalletGroup(walletGroup);
+    } catch (error) {
+      Toast.show({
+        type: 'info',
+        text1: 'Não foi possível apagar a conexão com o provedor!',
+      });
+      hasError = true;
+    }
+
+    if (!hasError) {
+      Toast.show({ type: 'success', text1: 'Carteira removida com sucesso!' });
+    }
+
+    setFetchingWallets(false);
+  };
+
+  const fetchTransactions = async () => {
+    setFetchingTransactions(true);
+
+    try {
+      const transactions = await transactionRepository.getTransactions(transactionQueryOptions);
+      setTransactions(transactions);
+    } catch (error) {
+      Toast.show({ type: 'error', text1: 'Não foi possível obter informações das transações!' });
+    }
+
+    setFetchingTransactions(false);
+  };
+
+  const createTransaction = async (transaction: Transaction) => {
+    setFetchingTransactions(true);
+
+    try {
+      await transactionRepository.setTransaction(transaction);
+      Toast.show({ type: 'success', text1: 'Transação criada com sucesso!' });
+    } catch (error) {
+      Toast.show({ type: 'error', text1: 'Não foi possível criar a transação!' });
+    }
+
+    setFetchingTransactions(false);
+  };
+
+  const updateTransaction = async (
+    id: string,
+    values: RecursivePartial<Transaction>,
+    updateWalletBalance: boolean,
+  ) => {
+    setFetchingTransactions(true);
+
+    try {
+      await transactionRepository.updateTransaction(id, values, updateWalletBalance);
+      Toast.show({ type: 'success', text1: 'Transação alterada com sucesso!' });
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível atualizar as informações da transação!',
+      });
+    }
+
+    setFetchingTransactions(false);
+  };
+
+  const deleteTransaction = async (transaction: Transaction) => {
+    setFetchingTransactions(true);
+
+    try {
+      await transactionRepository.deleteTransaction(transaction);
+      Toast.show({ type: 'success', text1: 'Transação removida com sucesso!' });
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível apagar a transação.',
+      });
+    }
+
+    setFetchingTransactions(false);
+  };
+
+  const fetchMonthlyBalancesPage = async (itemsPerPage: number, currentPage: number) => {
+    if (wallets.length === 0) {
+      return;
+    }
+
+    setFetchingMonthlyBalances(true);
+
+    const dates = range(itemsPerPage).map((i) =>
+      CURRENT_MONTH.clone().subtract(i + currentPage * itemsPerPage, 'months'),
+    );
+
+    const results = await Promise.all(
+      dates.map((date) =>
+        transactionRepository.getTransactions({
+          interval: {
+            startDate: date.startOf('month').toDate(),
+            endDate: date.endOf('month').toDate(),
+          },
+          order: {
+            by: 'date',
+            direction: 'desc',
+          },
+        }),
+      ),
+    );
+
+    const newBalances: MonthlyBalance[] = results.map((transactions, index) => {
+      const incomes = transactions
+        .filter((transaction) => transaction.type === 'INCOME' && !transaction.ignore)
+        .reduce((total, transaction) => total + transaction.amount, 0);
+
+      const expenses = transactions
+        .filter((transaction) => transaction.type === 'EXPENSE' && !transaction.ignore)
+        .reduce((total, transaction) => total + Math.abs(transaction.amount), 0);
+
+      return { date: dates[index], incomes, expenses };
+    });
+
+    setMonthlyBalances((current) =>
+      currentPage === 0 ? newBalances : [...current, ...newBalances],
+    );
+
+    setFetchingMonthlyBalances(false);
+  };
+
+  const exportTransactions = async () => {
+    setLoading(true, 'Exportando transações');
+
+    try {
+      let directory = FileSystem.documentDirectory;
+
+      if (!directory) {
+        setLoading(false);
+        return;
+      }
+
+      if (Platform.OS === 'android') {
+        const permissions =
+          await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+
+        if (!permissions.granted) {
+          throw 'Permission denied!';
+        }
+
+        directory = permissions.directoryUri;
+      }
+
+      const filename = `transactions_${moment().toISOString()}.json`;
+
+      const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(
+        directory,
+        filename,
+        'application/json',
+      );
+
+      const allTransactions = await transactionRepository.getTransactions();
+      const content = JSON.stringify(allTransactions);
+
+      await FileSystem.writeAsStringAsync(fileUri, content, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      Toast.show({ type: 'success', text1: 'Transações exportadas com sucesso!' });
+    } catch (error) {
+      Toast.show({
+        type: 'error',
+        text1: 'Não foi possível exportar as transações.',
+      });
+    }
+
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    return walletRepository.onWalletsChange((wallets) => setWallets(wallets));
+  }, []);
+
+  useEffect(() => {
+    return walletGroupRepository.onWalletGroupsChange((walletGroups) =>
+      setWalletGroups(walletGroups),
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!walletGroups || walletGroups.length === 0) {
+      return;
+    }
+
+    const walletGroupsToSync = walletGroups.filter(
+      (walletGroup) =>
+        walletGroup.type === 'AUTOMATIC' && NOW.isAfter(walletGroup.lastUpdatedAt, 'day'),
+    );
+
+    if (!walletGroupsToSync.length) {
+      return;
+    }
+
+    const syncAllConnections = async () => {
+      setLoading(true, 'Sincronizando conexões');
+      await Promise.all(
+        walletGroupsToSync.map((walletGroup) => syncWalletGroup(walletGroup, false)),
+      );
+      setLoading(false);
+    };
+
+    syncAllConnections();
+  }, [syncWalletGroup, walletGroups]);
+
+  useEffect(() => {
+    return transactionRepository.onTransactionsChange(
+      (transactions) => setTransactions(transactions),
+      transactionQueryOptions,
+    );
+  }, [transactionQueryOptions]);
+
+  useEffect(() => {
+    setMonthlyBalances([]);
+    setCurrentMonthlyBalancesPage(0);
+  }, []);
+
+  return (
+    <AppContext.Provider
+      value={{
+        date,
+        setDate,
+        hideValues,
+        setHideValues,
+        setupConnection,
+        syncWalletGroup,
+        wallets,
+        fetchWallets,
+        fetchingWallets,
+        updateWallet,
+        totalBalance,
+        walletGroups,
+        fetchWalletGroups,
+        fetchingWalletGroups,
+        createManualWallet,
+        updateWalletGroup,
+        deleteWalletGroup,
+        transactions,
+        fetchTransactions,
+        fetchingTransactions,
+        createTransaction,
+        updateTransaction,
+        deleteTransaction,
+        incomeTransactions,
+        expenseTransactions,
+        totalIncomes,
+        totalExpenses,
+        totalInvoice,
+        totalInvestment,
+        monthlyBalances,
+        fetchMonthlyBalancesPage,
+        fetchingMonthlyBalances,
+        currentMonthlyBalancesPage,
+        setCurrentMonthlyBalancesPage,
+        exportTransactions,
+      }}
+    >
+      {children}
+      {isLoading && <LoadingModal text={loadingMessage} />}
+    </AppContext.Provider>
+  );
+};
+
+export default AppContext;
